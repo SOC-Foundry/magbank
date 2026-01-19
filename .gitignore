@@ -1,0 +1,14 @@
+# Python virtual environment
+venv/
+
+# Python cache files
+__pycache__/
+
+# Log files
+*.jsonl
+
+# Ignore all markdown files by default
+*.md
+
+# Re-include specific markdown files
+!/magbank-monitor/README.md
