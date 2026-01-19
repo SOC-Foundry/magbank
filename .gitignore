@@ -11,4 +11,4 @@ __pycache__/
 *.md
 
 # Re-include specific markdown files
-!/magbank-monitor/README.md
+!README.md
