@@ -6,12 +6,16 @@ import random
 import argparse
 import sys
 import struct
+import select
+import termios
+import tty
 from pathlib import Path
 from rich.console import Console
 from rich.live import Live
 from rich.table import Table
 from rich.panel import Panel
 from rich.layout import Layout
+from rich.text import Text
 from rich import box
 
 # Try to import pyusb and crc
@@ -58,14 +62,101 @@ class FNB58Device:
             "dp_v": 0.0,
             "dm_v": 0.0
         }
-        
+
         # Simulation state
         self.sim_capacity_wh = 0.0
         self.sim_capacity_mah = 0.0
         self.sim_start_time = time.time()
-        
-        # Integration
+
+        # Integration state
         self.last_read_time = time.time()
+
+        # Temperature smoothing (EMA)
+        self.temp_ema = None
+        self.temp_alpha = 0.9  # Smoothing factor (0.9 = heavy smoothing)
+
+        # Sample timing for accurate integration
+        self.sample_interval = 0.01  # 10ms per sample (100 Hz)
+
+        # Session tracking
+        self.session_start_time = time.time()
+
+        # Statistics tracking
+        self.stats = {
+            "voltage_min": float('inf'),
+            "voltage_max": float('-inf'),
+            "voltage_sum": 0.0,
+            "current_min": float('inf'),
+            "current_max": float('-inf'),
+            "current_sum": 0.0,
+            "sample_count": 0
+        }
+
+    def reset_session(self):
+        """Reset session counters and statistics"""
+        self.data["energy_wh"] = 0.0
+        self.data["capacity_mah"] = 0.0
+        self.session_start_time = time.time()
+        self.temp_ema = None
+
+        # Reset simulation counters too
+        self.sim_capacity_wh = 0.0
+        self.sim_capacity_mah = 0.0
+        self.sim_start_time = time.time()
+
+        # Reset statistics
+        self.stats = {
+            "voltage_min": float('inf'),
+            "voltage_max": float('-inf'),
+            "voltage_sum": 0.0,
+            "current_min": float('inf'),
+            "current_max": float('-inf'),
+            "current_sum": 0.0,
+            "sample_count": 0
+        }
+
+    def get_session_duration(self):
+        """Get formatted session duration"""
+        elapsed = time.time() - self.session_start_time
+        hours, remainder = divmod(int(elapsed), 3600)
+        minutes, seconds = divmod(remainder, 60)
+        if hours > 0:
+            return f"{hours}:{minutes:02d}:{seconds:02d}"
+        else:
+            return f"{minutes:02d}:{seconds:02d}"
+
+    def get_stats_display(self):
+        """Get formatted statistics for display"""
+        s = self.stats
+        if s["sample_count"] == 0:
+            return {
+                "voltage": "- / - / -",
+                "current": "- / - / -"
+            }
+
+        v_avg = s["voltage_sum"] / s["sample_count"]
+        c_avg = s["current_sum"] / s["sample_count"]
+
+        # Handle inf values for display
+        v_min = s["voltage_min"] if s["voltage_min"] != float('inf') else 0
+        v_max = s["voltage_max"] if s["voltage_max"] != float('-inf') else 0
+        c_min = s["current_min"] if s["current_min"] != float('inf') else 0
+        c_max = s["current_max"] if s["current_max"] != float('-inf') else 0
+
+        return {
+            "voltage": f"{v_min:.2f} / {v_avg:.2f} / {v_max:.2f}",
+            "current": f"{c_min:.3f} / {c_avg:.3f} / {c_max:.3f}"
+        }
+
+    def _update_stats(self, voltage, current):
+        """Update running statistics"""
+        self.stats["voltage_min"] = min(self.stats["voltage_min"], voltage)
+        self.stats["voltage_max"] = max(self.stats["voltage_max"], voltage)
+        self.stats["voltage_sum"] += voltage
+        self.stats["current_min"] = min(self.stats["current_min"], current)
+        self.stats["current_max"] = max(self.stats["current_max"], current)
+        self.stats["current_sum"] += current
+        self.stats["sample_count"] += 1
 
     def connect(self):
         if self.simulate:
@@ -88,15 +179,16 @@ class FNB58Device:
             
             console.print("[bold green]FNB58: Device found.[/bold green]")
 
-            # Detach kernel driver if active for Interface 3
-            if self.device.is_kernel_driver_active(intf_number):
-                try:
-                    console.print(f"[yellow]FNB58: Detaching kernel driver from Interface {intf_number}...[/yellow]")
-                    self.device.detach_kernel_driver(intf_number)
-                    console.print("[green]FNB58: Driver detached.[/green]")
-                except usb.core.USBError as e:
-                    console.print(f"[red]FNB58: Could not detach driver (may be resource busy): {e}[/red]")
-                    # If cannot detach, might be resource busy, try to proceed
+            # Detach kernel drivers from ALL interfaces (required for clean access)
+            for cfg in self.device:
+                for intf in cfg:
+                    intf_num = intf.bInterfaceNumber
+                    if self.device.is_kernel_driver_active(intf_num):
+                        try:
+                            console.print(f"[yellow]FNB58: Detaching kernel driver from Interface {intf_num}...[/yellow]")
+                            self.device.detach_kernel_driver(intf_num)
+                        except usb.core.USBError as e:
+                            console.print(f"[dim]FNB58: Interface {intf_num} detach warning: {e}[/dim]")
 
             # Set configuration
             try:
@@ -159,72 +251,116 @@ class FNB58Device:
             t = current_time - self.sim_start_time
             noise = random.uniform(-0.01, 0.01)
             self.data["voltage_v"] = 5.0 + (noise * 0.1)
-            self.data["current_a"] = 2.0 + noise 
+            self.data["current_a"] = 2.0 + noise
             self.data["power_w"] = self.data["voltage_v"] * self.data["current_a"]
-            
+
             self.sim_capacity_wh += self.data["power_w"] * (time_delta / 3600.0)
             self.sim_capacity_mah += (self.data["current_a"] * 1000.0) * (time_delta / 3600.0)
-            
+
             self.data["energy_wh"] = self.sim_capacity_wh
             self.data["capacity_mah"] = self.sim_capacity_mah
             self.data["temp_c"] = 30.0 + (t / 60.0)
             self.data["protocol"] = "PD 3.0 (Sim)"
+            self.data["dp_v"] = 0.6
+            self.data["dm_v"] = 0.6
             return self.data
 
         if not self.connected:
             return None
 
         try:
+            # Request data from device
             cmd_data_request = b"\xaa\x83" + b"\x00" * 61 + b"\x9e"
             self.ep_out.write(cmd_data_request, timeout=1000)
-            
+
             data = self.device.read(self.ep_in.bEndpointAddress, 64, timeout=1000)
-            
+
             if len(data) == 64 and data[0] == 0xAA:
                 packet_type = data[1]
                 if packet_type == 0x04:
-                    base = 47
-                    v_raw = data[base] + (data[base+1] << 8) + (data[base+2] << 16) + (data[base+3] << 24)
-                    self.data["voltage_v"] = v_raw / 100000.0
-                    
-                    c_raw = data[base+4] + (data[base+5] << 8) + (data[base+6] << 16) + (data[base+7] << 24)
-                    self.data["current_a"] = c_raw / 100000.0
-                    
-                    # DP / DM (2 bytes each, unit=mV -> /1000 for V)
-                    dp_raw = data[base+8] + (data[base+9] << 8)
-                    # Try swapping DM and Temp offsets based on debug data
-                    # Previously: DM at +10, Temp at +12
-                    # New Hypothesis: Temp at +10, Unknown/DM at +12
-                    
-                    # Temp (Offset 10)
-                    t_raw = data[base+10] + (data[base+11] << 8)
-                    self.data["temp_c"] = t_raw / 100.0 
+                    # Process all 4 samples in the packet for accurate integration
+                    # Each packet contains 4 samples, each 15 bytes, starting at offset 2
+                    # Sample structure (15 bytes):
+                    #   0-3: voltage (4 bytes, little endian, /100000 for V)
+                    #   4-7: current (4 bytes, little endian, /100000 for A)
+                    #   8-9: D+ voltage (2 bytes, /1000 for V)
+                    #  10-11: D- voltage (2 bytes, /1000 for V)
+                    #     12: unknown (constant)
+                    #  13-14: temperature (2 bytes, /10 for °C)
 
-                    # DM (Offset 12 - might be junk or the actual DM?)
-                    dm_raw = data[base+12] + (data[base+13] << 8)
-                    self.data["dm_v"] = dm_raw / 1000.0
-                    
-                    # Power & Energy
-                    self.data["power_w"] = self.data["voltage_v"] * self.data["current_a"]
-                    
-                    if self.data["power_w"] > 0:
-                        dt = REFRESH_RATE / 3600.0 # hours
-                        self.data["energy_wh"] += self.data["power_w"] * dt
-                        self.data["capacity_mah"] += (self.data["current_a"] * 1000.0) * dt
-                    
-                    # Protocol Guess
+                    for i in range(4):
+                        offset = 2 + (15 * i)
+
+                        # Voltage (4 bytes, little endian)
+                        v_raw = (data[offset] |
+                                (data[offset + 1] << 8) |
+                                (data[offset + 2] << 16) |
+                                (data[offset + 3] << 24))
+                        voltage = v_raw / 100000.0
+
+                        # Current (4 bytes, little endian)
+                        c_raw = (data[offset + 4] |
+                                (data[offset + 5] << 8) |
+                                (data[offset + 6] << 16) |
+                                (data[offset + 7] << 24))
+                        current = c_raw / 100000.0
+
+                        # D+ voltage (2 bytes)
+                        dp_raw = data[offset + 8] | (data[offset + 9] << 8)
+                        dp_v = dp_raw / 1000.0
+
+                        # D- voltage (2 bytes)
+                        dm_raw = data[offset + 10] | (data[offset + 11] << 8)
+                        dm_v = dm_raw / 1000.0
+
+                        # Temperature (2 bytes, offset 13-14, /10 for °C)
+                        t_raw = data[offset + 13] | (data[offset + 14] << 8)
+                        temp_c = t_raw / 10.0
+
+                        # Apply temperature EMA smoothing
+                        if self.temp_ema is None:
+                            self.temp_ema = temp_c
+                        else:
+                            self.temp_ema = temp_c * (1.0 - self.temp_alpha) + self.temp_ema * self.temp_alpha
+
+                        # Integrate energy and capacity for each sample (10ms interval)
+                        power = voltage * current
+                        dt_hours = self.sample_interval / 3600.0
+                        self.data["energy_wh"] += power * dt_hours
+                        self.data["capacity_mah"] += (current * 1000.0) * dt_hours
+
+                    # Store the last sample values for display
+                    self.data["voltage_v"] = voltage
+                    self.data["current_a"] = current
+                    self.data["power_w"] = voltage * current
+                    self.data["dp_v"] = dp_v
+                    self.data["dm_v"] = dm_v
+                    self.data["temp_c"] = self.temp_ema
+
+                    # Update statistics
+                    self._update_stats(voltage, current)
+
+                    # Protocol detection
                     if self.data["voltage_v"] > 8.0:
                         self.data["protocol"] = "PD / QC (HV)"
+                    elif self.data["dp_v"] > 2.0:
+                        self.data["protocol"] = "QC 2.0/3.0"
                     elif self.data["dp_v"] > 0.6 and self.data["dm_v"] > 0.6:
                         self.data["protocol"] = "DCP 1.5A"
+                    elif self.data["dp_v"] > 0.4:
+                        self.data["protocol"] = "Apple 2.4A"
                     else:
                         self.data["protocol"] = "Standard 5V"
 
                     return self.data
-                
+
+        except usb.core.USBTimeoutError:
+            console.print("[yellow]FNB58: Read timeout[/yellow]")
+        except usb.core.USBError as e:
+            console.print(f"[red]FNB58 USB Error: {e}[/red]")
         except Exception as e:
-            pass
-        
+            console.print(f"[red]FNB58 Read Error: {e}[/red]")
+
         return None
 
     def disconnect(self):
@@ -342,20 +478,27 @@ def generate_dashboard(fnb_device, sys_supplies):
         )
         
         # Row 2: Integration (Wh, mAh, Temp)
-        t_raw_debug = int(d['temp_c'] * 100) # Reverse the calc to show raw
         grid.add_row(
             Panel(f"[bold white]{d['energy_wh']:.4f} Wh[/bold white]", title="Energy", border_style="white"),
             Panel(f"[bold yellow]{d['capacity_mah']:.1f} mAh[/bold yellow]", title="Capacity (Session)", border_style="yellow"),
-            Panel(f"[white]{d['temp_c']:.1f} °C[/white]\n[dim](Raw: {t_raw_debug})[/dim]", title="Temp", border_style="blue")
+            Panel(f"[white]{d['temp_c']:.1f} °C[/white]", title="Temp", border_style="blue")
         )
         
-        # Row 3: Technical (D+, D-, Protocol)
+        # Row 3: Technical (D+, D-, Protocol, Session)
         grid.add_row(
             Panel(f"D+: {d['dp_v']:.2f} V\nD-: {d['dm_v']:.2f} V", title="Data Lines", border_style="dim"),
             Panel(f"[bold magenta]{d['protocol']}[/bold magenta]", title="Protocol", border_style="magenta"),
-            Panel(f"[dim]Time: {datetime.datetime.now().strftime('%H:%M:%S')}[/dim]", title="Live", border_style="dim")
+            Panel(f"[bold]{fnb_device.get_session_duration()}[/bold]\n[dim]{datetime.datetime.now().strftime('%H:%M:%S')}[/dim]", title="Session", border_style="dim")
         )
-        
+
+        # Row 4: Statistics (min/avg/max)
+        stats = fnb_device.get_stats_display()
+        grid.add_row(
+            Panel(f"[dim]min / avg / max[/dim]\n{stats['voltage']} V", title="Voltage Stats", border_style="green"),
+            Panel(f"[dim]min / avg / max[/dim]\n{stats['current']} A", title="Current Stats", border_style="cyan"),
+            Panel("[dim][r][/dim] Reset  [dim][q][/dim] Quit", title="Controls", border_style="dim")
+        )
+
         fnb_panel = Panel(grid, title="[bold blue]EXTERNAL LOAD (FNB58 Remote Display)[/bold blue]", border_style="blue")
     else:
         fnb_panel = Panel(
@@ -417,22 +560,45 @@ def log_snapshot(fnb_device, sys_supplies):
             f.write(json.dumps(record) + "\n")
     except Exception: pass
 
+def get_key_nonblocking():
+    """Check for keypress without blocking. Returns key char or None."""
+    if select.select([sys.stdin], [], [], 0)[0]:
+        return sys.stdin.read(1)
+    return None
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--simulate", action="store_true", help="Simulate FNB58")
     args = parser.parse_args()
 
     console.clear()
-    
+
     # Initialize FNB58
     fnb = FNB58Device(simulate=args.simulate)
     fnb.connect()
-    
+
+    # Save terminal settings for raw mode
+    old_settings = termios.tcgetattr(sys.stdin)
+
     try:
+        # Set terminal to raw mode for non-blocking key detection
+        tty.setcbreak(sys.stdin.fileno())
+
         # Use Layout instead of just Table
         with Live(generate_dashboard(fnb, []), refresh_per_second=REFRESH_RATE, screen=True) as live:
-            while True:
+            running = True
+            while running:
                 try:
+                    # Check for keyboard input
+                    key = get_key_nonblocking()
+                    if key:
+                        if key.lower() == 'q':
+                            running = False
+                            break
+                        elif key.lower() == 'r':
+                            fnb.reset_session()
+
                     # Refresh FNB58
                     if fnb.connected or fnb.simulate:
                         fnb.read_data()
@@ -444,13 +610,15 @@ def main():
 
                     live.update(generate_dashboard(fnb, sys_supplies))
                     log_snapshot(fnb, sys_supplies)
-                    
+
                     time.sleep(REFRESH_RATE)
                 except KeyboardInterrupt:
                     break
     finally:
+        # Restore terminal settings
+        termios.tcsetattr(sys.stdin, termios.TCSADRAIN, old_settings)
         fnb.disconnect()
-    
+
     console.print("\n[bold red]Monitor stopped.[/bold red]")
 
 if __name__ == "__main__":

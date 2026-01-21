@@ -6,14 +6,20 @@ Designed specifically for the **FNIRSI FNB58** USB Tester.
 
 ![Dashboard Preview](https://via.placeholder.com/800x400?text=MagBank+Monitor+CLI+Dashboard)
 
-## 🚀 Key Features
+## Key Features
 
 *   **Remote Telemetry Dashboard:** Mirrors the FNB58's internal measurements to your PC screen via HID, allowing for monitoring even when the physical device screen is obscured.
     *   **VBUS / IBUS / PBUS:** Real-time Voltage, Current, and Power monitoring.
-    *   **Protocol Analysis:** Displays D+/D- voltages and inferred charging protocols (PD, QC, etc.).
+    *   **Protocol Analysis:** Displays D+/D- voltages and inferred charging protocols (PD, QC, DCP, Apple 2.4A).
 *   **Capacity & Health Testing:**
-    *   **Software Integration:** Performs high-precision Coulomb counting (mAh and Wh accumulation) on the host side.
-    *   **Session Persistence:** Tracks total energy throughput for a charging session to verify manufacturer capacity claims.
+    *   **High-Precision Coulomb Counting:** Processes all 4 samples per packet (100 Hz) for accurate mAh and Wh accumulation.
+    *   **Session Management:** Track energy throughput with session timer and resettable counters.
+*   **Live Statistics:**
+    *   **Min / Avg / Max:** Real-time statistics for voltage and current throughout the session.
+    *   **Temperature Monitoring:** EMA-smoothed temperature display.
+*   **Interactive Controls:**
+    *   **[r] Reset:** Reset session counters, statistics, and timer mid-session.
+    *   **[q] Quit:** Clean exit with proper USB cleanup.
 *   **Hybrid Monitoring:** Simultaneously monitors external USB loads *and* host system power sensors (internal laptop battery, AC status) in a unified split-screen view.
 *   **Zero-Driver Setup:** Uses pure Python `pyusb` with custom `udev` rules—no kernel modules required.
 
@@ -66,17 +72,35 @@ Designed specifically for the **FNIRSI FNB58** USB Tester.
     python3 monitor.py --simulate
     ```
 
-## 📊 Dashboard Layout
+## Dashboard Layout
 
 The interface is divided into two logical sectors:
 
-*   **EXTERNAL LOAD (Top):** Displays high-frequency telemetry from the FNB58. Use this to monitor the specific device you are testing.
+*   **EXTERNAL LOAD (Top):** Displays high-frequency telemetry from the FNB58:
+    *   Row 1: Voltage (VBUS) / Current (IBUS) / Power (PBUS)
+    *   Row 2: Energy (Wh) / Capacity (mAh) / Temperature
+    *   Row 3: Data Lines (D+/D-) / Protocol / Session Timer
+    *   Row 4: Voltage Stats (min/avg/max) / Current Stats (min/avg/max) / Controls
 *   **SYSTEM SENSORS (Bottom):** Displays the host computer's internal power status (Battery %, Charging State), provided by the Linux kernel (`/sys/class/power_supply`).
 
-## 🔧 Technical Details
+### Keyboard Controls
+
+| Key | Action |
+|-----|--------|
+| `r` | Reset session (clears mAh, Wh, statistics, and timer) |
+| `q` | Quit the monitor |
+| `Ctrl+C` | Force quit |
+
+## Technical Details
 
 *   **Protocol:** Custom HID implementation over Interface 3, Interrupt Endpoints `0x83` (IN) and `0x03` (OUT).
-*   **Data Rate:** ~10-20Hz polling rate (configurable).
+*   **Data Rate:** 100 Hz sampling (4 samples per 64-byte packet), 1 Hz display refresh.
+*   **Packet Structure:** Each packet contains 4 samples of 15 bytes each:
+    *   Bytes 0-3: Voltage (32-bit LE, /100000 for V)
+    *   Bytes 4-7: Current (32-bit LE, /100000 for A)
+    *   Bytes 8-9: D+ voltage (16-bit LE, /1000 for V)
+    *   Bytes 10-11: D- voltage (16-bit LE, /1000 for V)
+    *   Bytes 13-14: Temperature (16-bit LE, /10 for C)
 *   **Logging:** All session data is automatically appended to `magbank_history.jsonl` for offline analysis.
 
 ## 🤝 Contributing
