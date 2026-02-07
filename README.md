@@ -17,6 +17,7 @@ Designed for the **FNIRSI FNB58** USB Tester and **Anker 575 USB-C Docking Stati
     *   **Gigabit Ethernet (RTL8153):** Auto-detects the dock's Realtek RTL8153 adapter by USB VID:PID — no hardcoded interface names. Shows link state, speed/duplex, MAC, MTU, real-time RX/TX rates (bytes/s + pps), cumulative totals, packet counts, error/drop counters, and carrier change events.
 *   **Capacity & Health Testing:**
     *   **High-Precision Coulomb Counting:** Processes all 4 samples per packet (100 Hz) for accurate mAh and Wh accumulation.
+    *   **Auto-Stop on Charge Complete:** Detects when a power bank finishes charging (power drops below 1W for 10s after active charging) and freezes mAh/Wh counters automatically — no more inflated readings from trickle current. Dashboard turns green with "COMPLETE" and session duration. Auto-resumes if a new bank is plugged in.
     *   **Session Management:** Track energy throughput with session timer and resettable counters.
 *   **Live Statistics:**
     *   **Min / Avg / Max:** Real-time statistics for voltage and current throughout the session.
@@ -73,7 +74,7 @@ Designed for the **FNIRSI FNB58** USB Tester and **Anker 575 USB-C Docking Stati
     ```
 
 3.  **Simulation Mode (No Hardware):**
-    To test the UI layout without an FNB58 connected (dock/ethernet data is always live from sysfs):
+    To test the UI layout without an FNB58 connected (dock/ethernet data is always live from sysfs). Simulates a full charge cycle: 15s active charging, ramp-down, then charge-complete trigger at ~30s.
     ```bash
     python3 monitor.py --simulate
     ```
@@ -84,7 +85,7 @@ The interface is divided into three panels:
 
 *   **EXTERNAL LOAD — FNB58 (Top):** High-frequency telemetry from the FNB58:
     *   Row 1: Voltage (VBUS) / Current (IBUS) / Power (PBUS)
-    *   Row 2: Energy (Wh) / Capacity (mAh) / Temperature
+    *   Row 2: Energy (Wh) / Capacity (mAh) / Temperature — panels show charge state: dim "Waiting..." before charging, yellow during active charge, "Settling..." during power drop detection, green "COMPLETE in MM:SS" when done
     *   Row 3: Data Lines (D+/D-) / Protocol / Session Timer
     *   Row 4: Voltage Stats (min/avg/max) / Current Stats (min/avg/max) / Controls
 *   **ANKER 575 USB-C DOCK (Middle):** Split horizontally:
