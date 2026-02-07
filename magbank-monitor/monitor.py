@@ -37,6 +37,10 @@ LOG_FILE = "magbank_history.jsonl"
 SYS_CLASS_DIR = "/sys/class/power_supply"
 REFRESH_RATE = 1  # seconds
 
+# Charge-complete detection
+CHARGE_ACTIVE_THRESHOLD_W = 1.0   # Power must have been above this to count as "was charging"
+CHARGE_COMPLETE_SUSTAIN_S = 10    # Power must stay below threshold for this long to trigger
+
 # FNB58 Constants
 VID_FNB58 = 0x2E3C
 PID_FNB58 = 0x5558
@@ -132,6 +136,13 @@ class FNB58Device:
         # Session tracking
         self.session_start_time = time.time()
 
+        # Charge-complete detection state
+        self.was_charging = False
+        self.charge_complete = False
+        self.idle_since = None
+        self.charge_complete_time = None
+        self.peak_power_w = 0.0
+
         # Statistics tracking
         self.stats = {
             "voltage_min": float('inf'),
@@ -154,6 +165,13 @@ class FNB58Device:
         self.sim_capacity_wh = 0.0
         self.sim_capacity_mah = 0.0
         self.sim_start_time = time.time()
+
+        # Reset charge-complete detection
+        self.was_charging = False
+        self.charge_complete = False
+        self.idle_since = None
+        self.charge_complete_time = None
+        self.peak_power_w = 0.0
 
         # Reset statistics
         self.stats = {
@@ -198,6 +216,16 @@ class FNB58Device:
             "voltage": f"{v_min:.2f} / {v_avg:.2f} / {v_max:.2f}",
             "current": f"{c_min:.3f} / {c_avg:.3f} / {c_max:.3f}"
         }
+
+    def get_charge_state(self):
+        """Return charge state string: 'charging', 'settling', 'complete', or 'idle'."""
+        if self.charge_complete:
+            return "complete"
+        if self.was_charging and self.idle_since is not None:
+            return "settling"
+        if self.was_charging:
+            return "charging"
+        return "idle"
 
     def _update_stats(self, voltage, current):
         """Update running statistics"""
@@ -308,12 +336,42 @@ class FNB58Device:
         if self.simulate:
             t = current_time - self.sim_start_time
             noise = random.uniform(-0.01, 0.01)
+
+            # Simulate a charge curve: full power 0-15s, ramp down 15-20s, trickle after 20s
+            if t < 15:
+                sim_current = 2.0 + noise
+            elif t < 20:
+                # Linear ramp from 2A down to 0.05A over 5s
+                frac = (t - 15) / 5.0
+                sim_current = 2.0 * (1.0 - frac) + 0.05 * frac + noise
+            else:
+                sim_current = 0.05 + noise
+
             self.data["voltage_v"] = 5.0 + (noise * 0.1)
-            self.data["current_a"] = 2.0 + noise
+            self.data["current_a"] = sim_current
             self.data["power_w"] = self.data["voltage_v"] * self.data["current_a"]
 
-            self.sim_capacity_wh += self.data["power_w"] * (time_delta / 3600.0)
-            self.sim_capacity_mah += (self.data["current_a"] * 1000.0) * (time_delta / 3600.0)
+            # Charge-complete detection (sim)
+            power = self.data["power_w"]
+            if power >= CHARGE_ACTIVE_THRESHOLD_W:
+                self.was_charging = True
+                self.idle_since = None
+                self.peak_power_w = max(self.peak_power_w, power)
+                if self.charge_complete:
+                    self.charge_complete = False
+                    self.charge_complete_time = None
+
+            if self.was_charging and not self.charge_complete:
+                if power < CHARGE_ACTIVE_THRESHOLD_W:
+                    if self.idle_since is None:
+                        self.idle_since = time.time()
+                    elif time.time() - self.idle_since >= CHARGE_COMPLETE_SUSTAIN_S:
+                        self.charge_complete = True
+                        self.charge_complete_time = datetime.datetime.now()
+
+            if not self.charge_complete:
+                self.sim_capacity_wh += power * (time_delta / 3600.0)
+                self.sim_capacity_mah += (self.data["current_a"] * 1000.0) * (time_delta / 3600.0)
 
             self.data["energy_wh"] = self.sim_capacity_wh
             self.data["capacity_mah"] = self.sim_capacity_mah
@@ -401,11 +459,30 @@ class FNB58Device:
                     else:
                         self.temp_ema = temp_c * (1.0 - self.temp_alpha) + self.temp_ema * self.temp_alpha
 
-                    # Integrate energy and capacity for each sample (10ms interval)
+                    # Charge-complete detection per sample
                     power = voltage * current
                     dt_hours = self.sample_interval / 3600.0
-                    self.data["energy_wh"] += power * dt_hours
-                    self.data["capacity_mah"] += (current * 1000.0) * dt_hours
+
+                    if power >= CHARGE_ACTIVE_THRESHOLD_W:
+                        self.was_charging = True
+                        self.idle_since = None
+                        self.peak_power_w = max(self.peak_power_w, power)
+                        if self.charge_complete:
+                            self.charge_complete = False
+                            self.charge_complete_time = None
+
+                    if self.was_charging and not self.charge_complete:
+                        if power < CHARGE_ACTIVE_THRESHOLD_W:
+                            if self.idle_since is None:
+                                self.idle_since = time.time()
+                            elif time.time() - self.idle_since >= CHARGE_COMPLETE_SUSTAIN_S:
+                                self.charge_complete = True
+                                self.charge_complete_time = datetime.datetime.now()
+
+                    # Only integrate when actively charging
+                    if not self.charge_complete:
+                        self.data["energy_wh"] += power * dt_hours
+                        self.data["capacity_mah"] += (current * 1000.0) * dt_hours
 
                 # Store the last sample values for display
                 self.data["voltage_v"] = voltage
@@ -866,10 +943,40 @@ def generate_dashboard(fnb_device, sys_supplies, dock_power=None, dock_eth=None)
             Panel(f"[bold gold1]{d['power_w']:.4f} W[/bold gold1]", title="Power [dim]PBUS[/dim]", border_style="gold1")
         )
 
-        # Row 2: Integration (Wh, mAh, Temp)
+        # Row 2: Integration (Wh, mAh, Temp) — with charge-complete state
+        charge_state = fnb_device.get_charge_state()
+        if charge_state == "complete":
+            if fnb_device.charge_complete_time:
+                elapsed = (fnb_device.charge_complete_time - datetime.datetime.fromtimestamp(fnb_device.session_start_time))
+                total_s = int(elapsed.total_seconds())
+                h, rem = divmod(total_s, 3600)
+                m, s = divmod(rem, 60)
+                dur = f"{h}:{m:02d}:{s:02d}" if h else f"{m:02d}:{s:02d}"
+            else:
+                dur = ""
+            mah_text = f"[bold green]{d['capacity_mah']:.1f} mAh[/bold green]\n[green]COMPLETE in {dur}[/green]"
+            mah_style = "green"
+            wh_text = f"[bold green]{d['energy_wh']:.4f} Wh[/bold green]"
+            wh_style = "green"
+        elif charge_state == "settling":
+            mah_text = f"[bold yellow]{d['capacity_mah']:.1f} mAh[/bold yellow]\n[dim]Settling...[/dim]"
+            mah_style = "yellow"
+            wh_text = f"[bold white]{d['energy_wh']:.4f} Wh[/bold white]"
+            wh_style = "white"
+        elif charge_state == "charging":
+            mah_text = f"[bold yellow]{d['capacity_mah']:.1f} mAh[/bold yellow]"
+            mah_style = "yellow"
+            wh_text = f"[bold white]{d['energy_wh']:.4f} Wh[/bold white]"
+            wh_style = "white"
+        else:
+            mah_text = f"[dim]{d['capacity_mah']:.1f} mAh\nWaiting...[/dim]"
+            mah_style = "dim"
+            wh_text = f"[dim]{d['energy_wh']:.4f} Wh[/dim]"
+            wh_style = "dim"
+
         grid.add_row(
-            Panel(f"[bold white]{d['energy_wh']:.4f} Wh[/bold white]", title="Energy", border_style="white"),
-            Panel(f"[bold yellow]{d['capacity_mah']:.1f} mAh[/bold yellow]", title="Capacity (Session)", border_style="yellow"),
+            Panel(wh_text, title="Energy", border_style=wh_style),
+            Panel(mah_text, title="Capacity (Session)", border_style=mah_style),
             Panel(f"[white]{d['temp_c']:.1f} °C[/white]", title="Temp", border_style="blue")
         )
 
